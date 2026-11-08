@@ -46,3 +46,14 @@ Options: `--flip`, `--rotate 90`, `--fps 60`, `--list`, `--device N`, `--backend
 - *Virtual camera failed on Windows/macOS*: OBS is not installed, or its virtual camera was never started once.
 - *Apps do not list the camera*: restart the app after starting the script, since some read the device list only at launch.
 - Other apps that need to see the camera before it streams (Zoom on some systems) work best if you start the script first.
+
+## Control panel (focus, exposure, zoom, ...)
+
+`python host/iphonecam_ui.py --width 1280 --height 720 --fps 60` opens a window with a live preview and controls:
+
+- **Focus**: auto, lock, manual distance slider, and click anywhere on the preview to focus there.
+- **Exposure**: auto with a brightness (EV) slider, or manual ISO and shutter speed.
+- **White balance**: auto or a temperature slider.
+- **Zoom**, **torch** (back camera), **front/back camera**, and **Reset all to auto**.
+
+It takes the same options as `iphonecam.py` (`--rotate`, `--flip`, `--decoders`, ...) and still feeds the virtual camera, so keep it open while streaming. Settings are remembered and re-applied if the phone reconnects. Needs the updated phone app (rebuild the IPA). Double-click `start-iphonecam-ui.bat` to launch it.

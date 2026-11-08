@@ -138,6 +138,53 @@ def transform(frame, rotate: int, flip: bool):
     return frame
 
 
+class Controller:
+    """Sends camera-control commands to the phone and remembers the latest value
+    of each, so the settings are re-applied automatically after a reconnect."""
+
+    RESET_COMMANDS = ("FOCUS AUTO", "EXPOSURE AUTO 0", "WB AUTO", "ZOOM 1", "TORCH 0")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sock = None
+        self.saved = {}  # command name -> last full command line (insertion ordered)
+
+    def _write(self, line: str) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.sendall((line + "\n").encode())
+            except OSError:
+                pass  # the session loop notices a dead connection and reconnects
+
+    def send(self, line: str) -> None:
+        key = line.split(" ", 1)[0]
+        with self.lock:
+            # a tap-to-focus point and an explicit focus mode replace each other
+            if key == "FOCUS":
+                self.saved.pop("FOCUSPOINT", None)
+            elif key == "FOCUSPOINT":
+                self.saved.pop("FOCUS", None)
+            self.saved.pop(key, None)
+            self.saved[key] = line
+            self._write(line)
+
+    def reset(self) -> None:
+        with self.lock:
+            self.saved.clear()
+        for line in self.RESET_COMMANDS:
+            self.send(line)
+
+    def attach(self, sock) -> None:
+        with self.lock:
+            self.sock = sock
+            for line in self.saved.values():
+                self._write(line)
+
+    def detach(self) -> None:
+        with self.lock:
+            self.sock = None
+
+
 class LatestFrame:
     """Shared slot holding the newest decoded frame plus simple counters."""
 
@@ -198,7 +245,7 @@ def receiver_loop(sock, state: LatestFrame, rotate: int, flip: bool, workers: in
         pool.shutdown(wait=False)
 
 
-def run_session(args) -> None:
+def run_session(args, controller=None, on_frame=None, stop_event=None, on_status=None) -> None:
     devices = list_devices()
     if not devices:
         raise ConnectionError(
@@ -212,6 +259,10 @@ def run_session(args) -> None:
     # Ask the phone app for the requested capture format (needs the updated app).
     sock.sendall(f"CONFIG {args.width} {args.height} {args.fps}\n".encode())
     print(f"Connected. Requested {args.width}x{args.height} at {args.fps} fps.")
+    if controller is not None:
+        controller.attach(sock)  # also re-sends any saved camera settings
+    if on_status is not None:
+        on_status("Connected. Waiting for video...")
 
     state = LatestFrame()
     threading.Thread(
@@ -224,9 +275,10 @@ def run_session(args) -> None:
     out_frames = 0
     last_received = 0
     last_skipped = 0
+    last_preview = 0.0
     last_t = time.time()
     try:
-        while True:
+        while not (stop_event is not None and stop_event.is_set()):
             if state.error is not None:
                 raise state.error
 
@@ -249,6 +301,8 @@ def run_session(args) -> None:
                         "'Start Virtual Camera' then stop it (this registers the device).\n"
                         "Linux: sudo modprobe v4l2loopback exclusive_caps=1")
                 print(f"Virtual camera active: '{cam.device}' at {w}x{h}")
+                if on_status is not None:
+                    on_status(f"Streaming {w}x{h} to '{cam.device}'")
 
             if (w, h) != (cam.width, cam.height):
                 frame = cv2.resize(frame, (cam.width, cam.height))
@@ -257,6 +311,12 @@ def run_session(args) -> None:
             # frame is repeated instead of the output rate wobbling.
             cam.send(frame)
             cam.sleep_until_next_frame()
+
+            if on_frame is not None:
+                t = time.perf_counter()
+                if t - last_preview >= 0.066:  # about 15 fps is plenty for a preview
+                    last_preview = t
+                    on_frame(frame)
 
             if args.preview:
                 cv2.imshow("iPhoneCam preview (q to quit)", frame)
@@ -279,6 +339,8 @@ def run_session(args) -> None:
                 last_received, last_skipped = received, skipped
                 out_frames, last_t = 0, now
     finally:
+        if controller is not None:
+            controller.detach()
         sock.close()
         if cam is not None:
             cam.close()
@@ -286,7 +348,24 @@ def run_session(args) -> None:
             cv2.destroyAllWindows()
 
 
-def main() -> None:
+def run_forever(args, controller=None, on_frame=None, stop_event=None, on_status=None) -> None:
+    """Run sessions until stopped, reconnecting whenever the phone drops out."""
+    while not (stop_event is not None and stop_event.is_set()):
+        try:
+            if on_status is not None:
+                on_status("Looking for iPhone...")
+            run_session(args, controller, on_frame, stop_event, on_status)
+        except (ConnectionError, ValueError, OSError) as e:
+            print(f"{e}\nRetrying in 3s... (Ctrl+C to quit)")
+            if on_status is not None:
+                on_status(f"{e} Retrying...")
+            if stop_event is not None:
+                stop_event.wait(3)
+            else:
+                time.sleep(3)
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Use an iPhone as a USB webcam.")
     p.add_argument("--port", type=int, default=5005, help="port the iPhone app listens on")
     p.add_argument("--width", type=int, default=1280, help="capture width requested from the phone")
@@ -301,7 +380,11 @@ def main() -> None:
     p.add_argument("--backend", default=None,
                    help="pyvirtualcam backend (obs, v4l2loopback, unitycapture); default auto")
     p.add_argument("--list", action="store_true", help="list connected iPhones and exit")
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args.list:
         try:
@@ -314,15 +397,10 @@ def main() -> None:
             print(f"[{i}] serial {d.get('SerialNumber')}  id {d.get('DeviceID')}")
         return
 
-    while True:
-        try:
-            run_session(args)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            return
-        except (ConnectionError, ValueError, OSError) as e:
-            print(f"{e}\nRetrying in 3s... (Ctrl+C to quit)")
-            time.sleep(3)
+    try:
+        run_forever(args)
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,20 @@ final class CameraServer: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var targetHeight: Int32 = 720
     private var targetFPS: Int = 30
 
+    // Camera controls, set by text commands from the PC and re-applied whenever
+    // the camera is reconfigured (resolution change, front/back switch).
+    private var currentDevice: AVCaptureDevice?
+    private var focusMode = "AUTO"            // AUTO | LOCK | MANUAL
+    private var lensPosition: Float = 0.5     // 0 = near, 1 = far
+    private var focusPoint: CGPoint?          // normalized, sensor orientation
+    private var exposureMode = "AUTO"         // AUTO | MANUAL
+    private var exposureBias: Float = 0
+    private var manualISO: Float = 200
+    private var shutterDenominator: Double = 60
+    private var wbKelvin: Float = 0           // 0 = automatic
+    private var zoomFactor: CGFloat = 1
+    private var torchOn = false
+
     func start() {
         UIApplication.shared.isIdleTimerDisabled = true
         AVCaptureDevice.requestAccess(for: .video) { ok in
@@ -60,6 +74,8 @@ final class CameraServer: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
         session.addInput(input)
         applyFormat(device)
+        currentDevice = device
+        applySettings()
 
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -116,14 +132,130 @@ final class CameraServer: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
     }
 
+    // Commands (one per line) from the PC:
+    //   CONFIG <w> <h> <fps>              FOCUS AUTO | LOCK | MANUAL <0..1>
+    //   FOCUSPOINT <x> <y>                EXPOSURE AUTO <bias> | MANUAL <iso> <shutter denominator>
+    //   WB AUTO | KELVIN <k>              ZOOM <factor>
+    //   TORCH <0|1>                       CAMERA FRONT | BACK
     private func handleCommand(_ line: String) {
-        let p = line.split(separator: " ")
-        guard p.count == 4, p[0] == "CONFIG",
-              let w = Int32(p[1]), let h = Int32(p[2]), let f = Int(p[3]),
-              (1...240).contains(f) else { return }
-        if w == targetWidth && h == targetHeight && f == targetFPS { return }
-        targetWidth = w; targetHeight = h; targetFPS = f
-        configureCamera()
+        let p = line.split(separator: " ").map(String.init)
+        guard let cmd = p.first else { return }
+        func num(_ i: Int) -> Double? { i < p.count ? Double(p[i]) : nil }
+
+        switch cmd {
+        case "CONFIG":
+            guard let w = num(1), let h = num(2), let f = num(3),
+                  w >= 1, w < 10000, h >= 1, h < 10000, f >= 1, f <= 240 else { return }
+            let nw = Int32(w), nh = Int32(h), nf = Int(f)
+            if nw == targetWidth && nh == targetHeight && nf == targetFPS { return }
+            targetWidth = nw; targetHeight = nh; targetFPS = nf
+            configureCamera()
+        case "FOCUS":
+            guard p.count >= 2 else { return }
+            focusMode = p[1]
+            if let v = num(2) { lensPosition = Float(min(max(v, 0), 1)) }
+            focusPoint = nil
+            applySettings()
+        case "FOCUSPOINT":
+            guard let x = num(1), let y = num(2) else { return }
+            focusMode = "AUTO"
+            focusPoint = CGPoint(x: min(max(x, 0), 1), y: min(max(y, 0), 1))
+            applySettings()
+        case "EXPOSURE":
+            guard p.count >= 2 else { return }
+            exposureMode = p[1]
+            if exposureMode == "MANUAL" {
+                if let iso = num(2) { manualISO = Float(iso) }
+                if let den = num(3), den >= 1, den <= 100000 { shutterDenominator = den }
+            } else if let bias = num(2) {
+                exposureBias = Float(bias)
+            }
+            applySettings()
+        case "WB":
+            guard p.count >= 2 else { return }
+            wbKelvin = (p[1] == "KELVIN") ? Float(num(2) ?? 0) : 0
+            applySettings()
+        case "ZOOM":
+            guard let z = num(1) else { return }
+            zoomFactor = CGFloat(z)
+            applySettings()
+        case "TORCH":
+            torchOn = (num(1) ?? 0) != 0
+            applySettings()
+        case "CAMERA":
+            guard p.count >= 2 else { return }
+            let front = (p[1] == "FRONT")
+            if front != usingFront { usingFront = front; configureCamera() }
+        default:
+            break
+        }
+    }
+
+    // Push the stored control values to the camera, clamped to what it supports.
+    private func applySettings() {
+        guard let device = currentDevice else { return }
+        do { try device.lockForConfiguration() } catch { return }
+        defer { device.unlockForConfiguration() }
+
+        // Focus
+        switch focusMode {
+        case "MANUAL":
+            if device.isLockingFocusWithCustomLensPositionSupported {
+                device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
+            }
+        case "LOCK":
+            if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+        default:
+            if let p = focusPoint, device.isFocusPointOfInterestSupported {
+                device.focusPointOfInterest = p
+            }
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+        }
+
+        // Exposure
+        if exposureMode == "MANUAL" {
+            let f = device.activeFormat
+            let iso = min(max(manualISO, f.minISO), f.maxISO)
+            var d = CMTime(value: 1, timescale: CMTimeScale(shutterDenominator))
+            if CMTimeCompare(d, f.minExposureDuration) < 0 { d = f.minExposureDuration }
+            if CMTimeCompare(d, device.activeVideoMaxFrameDuration) > 0 { d = device.activeVideoMaxFrameDuration }
+            device.setExposureModeCustom(duration: d, iso: iso, completionHandler: nil)
+        } else {
+            if focusMode == "AUTO", let p = focusPoint, device.isExposurePointOfInterestSupported {
+                device.exposurePointOfInterest = p
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+            let b = min(max(exposureBias, device.minExposureTargetBias), device.maxExposureTargetBias)
+            device.setExposureTargetBias(b, completionHandler: nil)
+        }
+
+        // White balance
+        if wbKelvin > 0 {
+            if device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+                let tt = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wbKelvin, tint: 0)
+                var g = device.deviceWhiteBalanceGains(for: tt)
+                let m = device.maxWhiteBalanceGain
+                g.redGain = min(max(g.redGain, 1), m)
+                g.greenGain = min(max(g.greenGain, 1), m)
+                g.blueGain = min(max(g.blueGain, 1), m)
+                device.setWhiteBalanceModeLocked(with: g, completionHandler: nil)
+            }
+        } else if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+            device.whiteBalanceMode = .continuousAutoWhiteBalance
+        }
+
+        // Zoom (capped at 10x)
+        let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 10)
+        device.videoZoomFactor = min(max(zoomFactor, device.minAvailableVideoZoomFactor), maxZoom)
+
+        // Torch (back camera only)
+        if device.hasTorch && device.isTorchAvailable {
+            device.torchMode = torchOn ? .on : .off
+        }
     }
 
     private func startListener() {
