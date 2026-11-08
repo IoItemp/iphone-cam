@@ -4,8 +4,8 @@ iphonecam.py - use an iPhone (running the iPhoneCam app) as a webcam over USB.
 
 Pipeline:
   iPhone camera -> iPhoneCam app (JPEG frames over TCP :5005)
-  -> usbmuxd USB tunnel -> this script -> virtual camera (OBS / v4l2loopback)
-  -> Zoom, Discord, OBS, browsers, etc. see it as a normal camera.
+  -> usbmuxd USB tunnel -> receiver thread (decode) -> output loop (steady clock)
+  -> virtual camera (OBS / v4l2loopback) -> Zoom, Streamlabs, OBS, browsers, etc.
 
 Usage:
   python iphonecam.py                 # auto-detect first iPhone
@@ -13,12 +13,18 @@ Usage:
   python iphonecam.py --flip          # mirror horizontally
   python iphonecam.py --rotate 90     # rotate 0/90/180/270
   python iphonecam.py --list          # list connected iPhones
+
+While running it prints, every 5 seconds:
+  in  = new frames per second arriving from the phone (the real camera rate)
+  out = frames per second delivered to the virtual camera (steady clock)
+  decode = average time to decode one frame on this PC
 """
 import argparse
 import plistlib
 import socket
 import struct
 import sys
+import threading
 import time
 
 import cv2
@@ -109,15 +115,17 @@ def connect_to_device(device_id: int, port: int) -> socket.socket:
 # ----------------------------------------------------------------- stream ---
 
 def read_frames(sock: socket.socket):
-    """Yield decoded BGR frames from the length-prefixed JPEG stream."""
+    """Yield (decoded BGR frame, decode time in seconds) from the JPEG stream."""
     while True:
         (length,) = struct.unpack(">I", _recv_exact(sock, 4))
         if length == 0 or length > 20_000_000:
             raise ValueError(f"bad frame length {length}")
         jpeg = _recv_exact(sock, length)
+        t0 = time.perf_counter()
         frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        dt = time.perf_counter() - t0
         if frame is not None:
-            yield frame
+            yield frame, dt
 
 
 def transform(frame, rotate: int, flip: bool):
@@ -130,6 +138,32 @@ def transform(frame, rotate: int, flip: bool):
     if flip:
         frame = cv2.flip(frame, 1)
     return frame
+
+
+class LatestFrame:
+    """Shared slot holding the newest decoded frame plus simple counters."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame = None
+        self.received = 0        # frames received since start
+        self.decode_time = 0.0   # summed decode seconds since last stats read
+        self.decode_count = 0
+        self.error = None        # exception raised in the receiver thread
+
+
+def receiver_loop(sock, state: LatestFrame, rotate: int, flip: bool) -> None:
+    """Runs in its own thread: read, decode and orient frames as fast as they arrive."""
+    try:
+        for frame, dt in read_frames(sock):
+            frame = transform(frame, rotate, flip)
+            with state.lock:
+                state.frame = frame
+                state.received += 1
+                state.decode_time += dt
+                state.decode_count += 1
+    except Exception as e:  # reported to the main thread, which decides to retry
+        state.error = e
 
 
 def run_session(args) -> None:
@@ -147,13 +181,27 @@ def run_session(args) -> None:
     sock.sendall(f"CONFIG {args.width} {args.height} {args.fps}\n".encode())
     print(f"Connected. Requested {args.width}x{args.height} at {args.fps} fps.")
 
-    cam = None
-    last_fps_t, frames = time.time(), 0
-    try:
-        for frame in read_frames(sock):
-            frame = transform(frame, args.rotate, args.flip)
-            h, w = frame.shape[:2]
+    state = LatestFrame()
+    threading.Thread(
+        target=receiver_loop, args=(sock, state, args.rotate, args.flip), daemon=True
+    ).start()
 
+    cam = None
+    out_frames = 0
+    last_received = 0
+    last_t = time.time()
+    try:
+        while True:
+            if state.error is not None:
+                raise state.error
+
+            with state.lock:
+                frame = state.frame
+            if frame is None:  # still waiting for the first frame
+                time.sleep(0.005)
+                continue
+
+            h, w = frame.shape[:2]
             if cam is None:
                 try:
                     cam = pyvirtualcam.Camera(
@@ -170,6 +218,8 @@ def run_session(args) -> None:
             if (w, h) != (cam.width, cam.height):
                 frame = cv2.resize(frame, (cam.width, cam.height))
 
+            # Deliver on a steady clock. If the phone is a little slow, the last
+            # frame is repeated instead of the output rate wobbling.
             cam.send(frame)
             cam.sleep_until_next_frame()
 
@@ -178,11 +228,18 @@ def run_session(args) -> None:
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     raise KeyboardInterrupt
 
-            frames += 1
+            out_frames += 1
             now = time.time()
-            if now - last_fps_t >= 5:
-                print(f"  {frames / (now - last_fps_t):.1f} fps")
-                last_fps_t, frames = now, 0
+            if now - last_t >= 5:
+                with state.lock:
+                    received = state.received
+                    dec_ms = (state.decode_time / state.decode_count * 1000
+                              if state.decode_count else 0.0)
+                    state.decode_time, state.decode_count = 0.0, 0
+                dt = now - last_t
+                print(f"  in {(received - last_received) / dt:5.1f} fps | "
+                      f"out {out_frames / dt:5.1f} fps | decode {dec_ms:4.1f} ms")
+                last_received, out_frames, last_t = received, 0, now
     finally:
         sock.close()
         if cam is not None:
