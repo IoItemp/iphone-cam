@@ -15,17 +15,20 @@ Usage:
   python iphonecam.py --list          # list connected iPhones
 
 While running it prints, every 5 seconds:
-  in  = new frames per second arriving from the phone (the real camera rate)
+  in  = new frames per second decoded from the phone (the real camera rate)
+  skipped = frames per second dropped because this PC could not decode them in time
   out = frames per second delivered to the virtual camera (steady clock)
   decode = average time to decode one frame on this PC
 """
 import argparse
+import os
 import plistlib
 import socket
 import struct
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -114,18 +117,13 @@ def connect_to_device(device_id: int, port: int) -> socket.socket:
 
 # ----------------------------------------------------------------- stream ---
 
-def read_frames(sock: socket.socket):
-    """Yield (decoded BGR frame, decode time in seconds) from the JPEG stream."""
+def read_jpegs(sock: socket.socket):
+    """Yield raw JPEG bytes from the length-prefixed stream (no decoding here)."""
     while True:
         (length,) = struct.unpack(">I", _recv_exact(sock, 4))
         if length == 0 or length > 20_000_000:
             raise ValueError(f"bad frame length {length}")
-        jpeg = _recv_exact(sock, length)
-        t0 = time.perf_counter()
-        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-        dt = time.perf_counter() - t0
-        if frame is not None:
-            yield frame, dt
+        yield _recv_exact(sock, length)
 
 
 def transform(frame, rotate: int, flip: bool):
@@ -146,24 +144,58 @@ class LatestFrame:
     def __init__(self):
         self.lock = threading.Lock()
         self.frame = None
-        self.received = 0        # frames received since start
+        self.seq = 0             # sequence number of the frame currently stored
+        self.received = 0        # frames decoded since start
+        self.skipped = 0         # frames dropped because all decoders were busy
         self.decode_time = 0.0   # summed decode seconds since last stats read
         self.decode_count = 0
         self.error = None        # exception raised in the receiver thread
 
 
-def receiver_loop(sock, state: LatestFrame, rotate: int, flip: bool) -> None:
-    """Runs in its own thread: read, decode and orient frames as fast as they arrive."""
-    try:
-        for frame, dt in read_frames(sock):
+def receiver_loop(sock, state: LatestFrame, rotate: int, flip: bool, workers: int) -> None:
+    """Runs in its own thread: read JPEGs and hand them to a pool of decoder threads.
+
+    Decoding one 1080p frame can take longer than the 16.7 ms available at 60 fps,
+    so several frames are decoded at once. A frame is skipped (never queued) when
+    every decoder is busy, so latency can't build up. Frames are published by
+    sequence number so a slow older frame can never replace a newer one.
+    """
+    pool = ThreadPoolExecutor(max_workers=workers)
+    slots = threading.BoundedSemaphore(workers)
+
+    def decode(seq: int, jpeg: bytes) -> None:
+        try:
+            t0 = time.perf_counter()
+            frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            dt = time.perf_counter() - t0
+            if frame is None:
+                return
             frame = transform(frame, rotate, flip)
             with state.lock:
-                state.frame = frame
+                if seq > state.seq:
+                    state.frame = frame
+                    state.seq = seq
                 state.received += 1
                 state.decode_time += dt
                 state.decode_count += 1
+        except Exception as e:
+            state.error = e
+        finally:
+            slots.release()
+
+    try:
+        seq = 0
+        for jpeg in read_jpegs(sock):
+            seq += 1
+            if slots.acquire(blocking=False):
+                pool.submit(decode, seq, jpeg)
+            else:
+                with state.lock:
+                    state.skipped += 1
     except Exception as e:  # reported to the main thread, which decides to retry
         state.error = e
+    finally:
+        pool.shutdown(wait=False)
 
 
 def run_session(args) -> None:
@@ -183,12 +215,15 @@ def run_session(args) -> None:
 
     state = LatestFrame()
     threading.Thread(
-        target=receiver_loop, args=(sock, state, args.rotate, args.flip), daemon=True
+        target=receiver_loop,
+        args=(sock, state, args.rotate, args.flip, args.decoders),
+        daemon=True
     ).start()
 
     cam = None
     out_frames = 0
     last_received = 0
+    last_skipped = 0
     last_t = time.time()
     try:
         while True:
@@ -233,13 +268,16 @@ def run_session(args) -> None:
             if now - last_t >= 5:
                 with state.lock:
                     received = state.received
+                    skipped = state.skipped
                     dec_ms = (state.decode_time / state.decode_count * 1000
                               if state.decode_count else 0.0)
                     state.decode_time, state.decode_count = 0.0, 0
                 dt = now - last_t
                 print(f"  in {(received - last_received) / dt:5.1f} fps | "
+                      f"skipped {(skipped - last_skipped) / dt:4.1f}/s | "
                       f"out {out_frames / dt:5.1f} fps | decode {dec_ms:4.1f} ms")
-                last_received, out_frames, last_t = received, 0, now
+                last_received, last_skipped = received, skipped
+                out_frames, last_t = 0, now
     finally:
         sock.close()
         if cam is not None:
@@ -254,6 +292,8 @@ def main() -> None:
     p.add_argument("--width", type=int, default=1280, help="capture width requested from the phone")
     p.add_argument("--height", type=int, default=720, help="capture height requested from the phone")
     p.add_argument("--fps", type=int, default=30, help="capture and virtual camera frame rate")
+    p.add_argument("--decoders", type=int, default=max(2, min(4, os.cpu_count() or 2)),
+                   help="parallel JPEG decoder threads (default: auto, 2 to 4)")
     p.add_argument("--device", type=int, default=0, help="which iPhone, if several are plugged in")
     p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0)
     p.add_argument("--flip", action="store_true", help="mirror horizontally")
