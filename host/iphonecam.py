@@ -143,7 +143,9 @@ def run_session(args) -> None:
     print(f"Found iPhone (serial {device.get('SerialNumber', '?')}). Connecting...")
 
     sock = connect_to_device(device["DeviceID"], args.port)
-    print("Connected. Receiving video.")
+    # Ask the phone app for the requested capture format (needs the updated app).
+    sock.sendall(f"CONFIG {args.width} {args.height} {args.fps}\n".encode())
+    print(f"Connected. Requested {args.width}x{args.height} at {args.fps} fps.")
 
     cam = None
     last_fps_t, frames = time.time(), 0
@@ -192,7 +194,9 @@ def run_session(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="Use an iPhone as a USB webcam.")
     p.add_argument("--port", type=int, default=5005, help="port the iPhone app listens on")
-    p.add_argument("--fps", type=int, default=30, help="virtual camera frame rate")
+    p.add_argument("--width", type=int, default=1280, help="capture width requested from the phone")
+    p.add_argument("--height", type=int, default=720, help="capture height requested from the phone")
+    p.add_argument("--fps", type=int, default=30, help="capture and virtual camera frame rate")
     p.add_argument("--device", type=int, default=0, help="which iPhone, if several are plugged in")
     p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0)
     p.add_argument("--flip", action="store_true", help="mirror horizontally")

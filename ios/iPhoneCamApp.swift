@@ -25,6 +25,9 @@ final class CameraServer: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var clients: [ObjectIdentifier: Client] = [:]
     private let port: NWEndpoint.Port = 5005
     private var usingFront = false
+    private var targetWidth: Int32 = 1280
+    private var targetHeight: Int32 = 720
+    private var targetFPS: Int = 30
 
     func start() {
         UIApplication.shared.isIdleTimerDisabled = true
@@ -56,6 +59,7 @@ final class CameraServer: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             return
         }
         session.addInput(input)
+        applyFormat(device)
 
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -73,6 +77,53 @@ final class CameraServer: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
         session.commitConfiguration()
         if !session.isRunning { session.startRunning() }
+    }
+
+    // Pick a camera format matching the requested size and frame rate.
+    // If the camera can't do it, the 720p preset stays in effect.
+    private func applyFormat(_ device: AVCaptureDevice) {
+        let fps = Double(targetFPS)
+        let match = device.formats.first { f in
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            return d.width == targetWidth && d.height == targetHeight
+                && f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= fps }
+        }
+        guard let format = match else { return }
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = format
+            let duration = CMTime(value: 1, timescale: CMTimeScale(targetFPS))
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            device.unlockForConfiguration()
+        } catch {
+            DispatchQueue.main.async { self.status = "Could not set format: \(error)" }
+        }
+    }
+
+    // The computer sends a line like "CONFIG 1920 1080 60\n" right after connecting.
+    private func receiveCommands(_ conn: NWConnection, buffer: String = "") {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+            var buf = buffer
+            if let data = data, let s = String(data: data, encoding: .utf8) { buf += s }
+            while let nl = buf.firstIndex(of: "\n") {
+                let line = String(buf[..<nl]).trimmingCharacters(in: .whitespacesAndNewlines)
+                buf = String(buf[buf.index(after: nl)...])
+                self.handleCommand(line)
+            }
+            if error == nil && !isComplete { self.receiveCommands(conn, buffer: buf) }
+        }
+    }
+
+    private func handleCommand(_ line: String) {
+        let p = line.split(separator: " ")
+        guard p.count == 4, p[0] == "CONFIG",
+              let w = Int32(p[1]), let h = Int32(p[2]), let f = Int(p[3]),
+              (1...240).contains(f) else { return }
+        if w == targetWidth && h == targetHeight && f == targetFPS { return }
+        targetWidth = w; targetHeight = h; targetFPS = f
+        configureCamera()
     }
 
     private func startListener() {
@@ -108,6 +159,7 @@ final class CameraServer: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             }
         }
         conn.start(queue: queue)
+        receiveCommands(conn)
         publishCount()
     }
 
