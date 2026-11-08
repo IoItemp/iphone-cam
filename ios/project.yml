@@ -1,0 +1,26 @@
+name: iPhoneCam
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  iPhoneCam:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - iPhoneCamApp.swift
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: iPhoneCam
+        NSCameraUsageDescription: Streams your camera to your computer over USB.
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.iphonecam
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: "NO"
